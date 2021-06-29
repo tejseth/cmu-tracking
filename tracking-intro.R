@@ -7,11 +7,21 @@ players <- read_csv(url("https://raw.githubusercontent.com/tejseth/Big-Data-Bowl
 plays <- read_csv(url("https://raw.githubusercontent.com/tejseth/Big-Data-Bowl-1/master/Data/plays.csv"))
 game1 <- read_csv(url("https://raw.githubusercontent.com/tejseth/Big-Data-Bowl-1/master/Data/tracking_gameId_2017090700.csv"))
 
+ID <- c("090700", "091000", "091001", "091002", "091003", "091004", "091005", "091007", "091008", "091009", "091010",
+        "091011", "091012", "091100", "091101", "091400", "091700", "091701", "091702", "091703", "091704","091705",
+        "091706", "091707", "091708", "091709","091710", "091711", "091712", "091713", "091800", "092100", "092401",
+        "092402", "092403", "092404", "092405", "092406", "092407","092408", "092409", "092410", "092411", "092412",
+        "092413", "092500", "092800", "100100", "100101", "100102", "100103", "100104", "100105", "100106","100107",
+        "100108", "100109", "100110", "100111", "100112", "100113", "100200", "100500", "100800", "100801","100802", 
+        "100803", "100804", "100805", "100806", "100807", "100808", "100809", "100810", "100811", "100900", "101200",
+        "101500","101501", "101502", "101503", "101504", "101505", "101506", "101507", "101508", "101509", "101510",
+        "101511", "101600")
+
 plays_select <- plays %>%
   filter(isSTPlay == "FALSE") %>%
-  mutate(pass_or_run = ifelse(is.na(PassLength), "R", "P")) %>%
+  mutate(pass_or_run = ifelse(is.na(PassLength), "Run", "Pass")) %>%
   select(gameId, playId, quarter, GameClock, down, yardsToGo, possessionTeam, 
-         yardlineNumber, offenseFormation, personnel.offense, pass_or_run)
+         yardlineNumber, offenseFormation, personnel.offense, defendersInTheBox, pass_or_run)
 
 plays_select <- plays_select %>%
   mutate(len = nchar(personnel.offense)) %>%
@@ -45,7 +55,8 @@ plays_select$num_wr <- as.numeric(plays_select$num_wr)
 plays_select <- plays_select %>%
   filter(!is.na(offenseFormation)) %>%
   filter(!is.na(num_rb)) %>%
-  filter(!is.na(yardlineNumber))
+  filter(!is.na(yardlineNumber)) %>%
+  filter(!is.na(defendersInTheBox))
   
 colSums(is.na(plays_select))
 
@@ -59,10 +70,8 @@ plays_select <- plays_select %>%
     offenseFormation == "JUMBO" | offenseFormation == "ACE" ~ 1,
     TRUE ~ 0
   ),
-  is_pistol = case_when(
-    offenseFormation == "PISTOL" | offenseFormation == "WILDCAT" ~ 1,
-    TRUE ~ 0
-  ))
+  is_pistol = ifelse(offenseFormation == "PISTOL", 1, 0),
+  is_wildcat = ifelse(offenseFormation == "WILDCAT", 1, 0))
 
 pbp_17 <- nflfastR::load_pbp(2017)
 
@@ -77,14 +86,35 @@ plays_select <- plays_select %>%
 
 colSums(is.na(plays_select))
 
-plays_model_data <- plays_select %>%
-  mutate(label = as.factor(ifelse(pass_or_run == "P", 1, 0))) %>%
-  select(quarter, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
-         is_shotgun, is_under_center, is_pistol, half_seconds_remaining, 
-         score_differential, label) %>%
-  select(label, everything())
+#create df of player positions and corresponding nflid
+player_positions <- players %>%
+  select(nflId, PositionAbbr)
 
-split_pbp <- initial_split(plays_model_data, 0.75, strata = label)
+#join player positions to tracking data by nflid
+game1 <- inner_join(player_positions, game1,
+                       by = c("nflId" = "nflId"))
+
+offense_positions <- c("C", "FB", "G", "QB", "RB", "TE", "WR", "T")
+
+width_of_form <- game1 %>%
+  filter(event == "ball_snap") %>%
+  filter(PositionAbbr %in% offense_positions) %>%
+  group_by(gameId, playId) %>%
+  summarize(width = max(y) - min(y))
+
+width_of_form$gameId <- as.character(width_of_form$gameId)
+
+plays_select <- plays_select %>%
+  left_join(width_of_form, by = c("gameId", "playId"))
+
+###########################################################################
+
+plays_model_data <- plays_select %>%
+  select(pass_or_run, quarter, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
+         is_shotgun, is_under_center, is_pistol, is_wildcat,
+         half_seconds_remaining, score_differential)
+
+split_pbp <- initial_split(plays_model_data, 0.75, strata = pass_or_run)
 
 train_data <- training(split_pbp)
 
@@ -127,18 +157,11 @@ pbp_pred_lr %>%
             .pred_1) %>% 
   # ggplot2 autoplot for AB line 
   # and the path of ROC curve
-  autoplot()
+  autoplot() 
 
 pbp_fit_lr %>%
   pull_workflow_fit() %>% 
-  vip(num_features = 20)
-
-#create df of player positions and corresponding nflid
-player_positions <- players %>%
-  select(nflId, PositionAbbr)
-
-#join player positions to tracking data by nflid
-tracking <- inner_join(player_positions, tracking,
-                       by = c("nflId" = "nflId"))
+  vip(num_features = 20) +
+  theme_bw()
 
 
