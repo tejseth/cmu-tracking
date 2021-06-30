@@ -1,6 +1,7 @@
 library(tidyverse)
 library(tidymodels)
 library(vip)
+library(data.table)
 
 games <- read_csv(url("https://raw.githubusercontent.com/tejseth/Big-Data-Bowl-1/master/Data/games.csv"))
 players <- read_csv(url("https://raw.githubusercontent.com/tejseth/Big-Data-Bowl-1/master/Data/players.csv"))
@@ -16,6 +17,22 @@ ID <- c("090700", "091000", "091001", "091002", "091003", "091004", "091005", "0
         "100803", "100804", "100805", "100806", "100807", "100808", "100809", "100810", "100811", "100900", "101200",
         "101500","101501", "101502", "101503", "101504", "101505", "101506", "101507", "101508", "101509", "101510",
         "101511", "101600")
+
+#blank dataframe to store tracking data
+df_tracking <- list()
+
+#iterating through all weeks
+for(i in 1:length(ID)){
+  
+  #temperory dataframe used for reading week for given iteration
+  df_tracking_temp <- read_csv(paste0("Data/tracking_gameId_2017",ID[i],".csv"),
+                               col_types = cols())
+  
+  df_tracking[[i]] <- df_tracking_temp
+  
+}
+
+tracking <- rbindlist(df_tracking)
 
 plays_select <- plays %>%
   filter(isSTPlay == "FALSE") %>%
@@ -91,12 +108,12 @@ player_positions <- players %>%
   select(nflId, PositionAbbr)
 
 #join player positions to tracking data by nflid
-game1 <- inner_join(player_positions, game1,
+tracking <- inner_join(player_positions, tracking,
                        by = c("nflId" = "nflId"))
 
 offense_positions <- c("C", "FB", "G", "QB", "RB", "TE", "WR", "T")
 
-width_of_form <- game1 %>%
+width_of_form <- tracking %>%
   filter(event == "ball_snap") %>%
   filter(PositionAbbr %in% offense_positions) %>%
   group_by(gameId, playId) %>%
@@ -107,12 +124,38 @@ width_of_form$gameId <- as.character(width_of_form$gameId)
 plays_select <- plays_select %>%
   left_join(width_of_form, by = c("gameId", "playId"))
 
+colSums(is.na(plays_select))
+
+tracking$gameId <- as.character(tracking$gameId)
+plays_select$gameId <- as.character(plays_select$gameId) 
+
+linemen_width <- tracking %>%
+  filter(PositionAbbr %in% c("T", "G", "C")) %>%
+  filter(event == "ball_snap") %>%
+  group_by(gameId, playId) %>%
+  summarise(linemen_width = max(y)- min(y))
+
+plays_select <- plays_select %>%
+  left_join(linemen_width, by = c("gameId", "playId"))
+
+plays_select <- plays_select %>%
+  mutate(prev_play = lag(pass_or_run)) %>%
+  mutate(prev_pass = ifelse(prev_play == "P", 1, 0)) %>%
+  select(-prev_play)
+
+plays_select$prev_pass[is.na(plays_select$prev_pass)] <- 0
+
+colSums(is.na(plays_select))
+
 ###########################################################################
 
 plays_model_data <- plays_select %>%
+  filter(!is.na(width)) %>%
   select(pass_or_run, quarter, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
          is_shotgun, is_under_center, is_pistol, is_wildcat,
-         half_seconds_remaining, score_differential)
+         half_seconds_remaining, score_differential, width, linemen_width, prev_pass)
+
+plays_model_data$pass_or_run <- as.factor(plays_model_data$pass_or_run)
 
 split_pbp <- initial_split(plays_model_data, 0.75, strata = pass_or_run)
 
@@ -120,7 +163,7 @@ train_data <- training(split_pbp)
 
 test_data <- testing(split_pbp)
 
-pbp_rec <- recipe(label ~ ., data = train_data) %>% 
+pbp_rec <- recipe(pass_or_run ~ ., data = train_data) %>% 
   step_corr(all_numeric(), threshold = 0.7) %>% 
   step_center(all_numeric()) %>%  # substract mean from numeric
   step_zv(all_predictors()) # remove zero-variance predictors
@@ -139,29 +182,70 @@ pbp_pred_lr <- predict(pbp_fit_lr, test_data) %>%
   # Get probabilities for the class for each observation
   bind_cols(predict(pbp_fit_lr, test_data, type = "prob")) %>% 
   # Add back a "truth" column for what the actual play_type was
-  bind_cols(test_data %>% select(label))
+  bind_cols(test_data %>% select(pass_or_run))
 
 pbp_pred_lr %>% 
-  # get Area under Curve
-  roc_auc(truth = label, 
-          .pred_1)
+  group_by(.pred_class, pass_or_run) %>%
+  summarize(perc = n() / nrow(pbp_pred_lr)) %>%
+  arrange(-perc)
+#We're getting it right 73.1% of the time
 
-pbp_pred_lr %>% 
-  # collect and report metrics
-  metrics(truth = label, 
-          .pred_class)
+table("Predictions" = pbp_pred_lr$.pred_class, "Observed" = pbp_pred_lr$pass_or_run)
 
-pbp_pred_lr %>% 
-  # calculate ROC curve
-  roc_curve(truth = label, 
-            .pred_1) %>% 
-  # ggplot2 autoplot for AB line 
-  # and the path of ROC curve
-  autoplot() 
+model_stats <- lr_wflow %>% 
+  finalize_workflow(pbp_fit_lr) %>%
+  fit(train_data) %>%
+  pull_workflow_fit() %>%
+  tidy()
 
-pbp_fit_lr %>%
-  pull_workflow_fit() %>% 
-  vip(num_features = 20) +
-  theme_bw()
+model_stats %>%
+  mutate(ord_term = fct_reorder(term, estimate)) %>%
+  ggplot(aes(x = estimate, y = ord_term)) +
+  geom_bar(aes(fill = ifelse(estimate > 0, "darkblue", "darkred")), stat = "identity") +
+  scale_color_identity(aesthetics = c("fill")) +
+  theme_bw() +
+  theme(legend.position = "none")
 
+rf_mod <- rand_forest(trees = 1000) %>% 
+  set_engine("ranger", 
+             importance = "impurity", # variable importance
+             num.threads = 4) %>%     # Parallelize
+  set_mode("classification")
+
+rf_wflow <- workflow() %>% 
+  add_model(rf_mod) %>%  # New model
+  add_recipe(pbp_rec)    # Same recipe
+
+pbp_fit_rf <- rf_wflow %>% # New workflow
+  fit(data = train_data)   # Fit the Random Forest
+# Get predictions and check metrics
+
+pbp_pred_rf <- predict(pbp_fit_rf, test_data) %>% 
+  bind_cols(test_data %>% select(pass_or_run)) %>% 
+  bind_cols(predict(pbp_fit_rf, test_data, type = "prob"))
+
+`pbp_pred_rf` %>% # Random Forest predictions
+  metrics(truth = pass_or_run, .pred_class)
+
+`pbp_pred_lr` %>% # Logistic Regression predictions
+  metrics(truth = pass_or_run, .pred_class)
+
+roc_rf <- pbp_pred_rf %>% 
+  roc_curve(truth = pass_or_run, .pred_Pass) %>% 
+  mutate(model = "Random Forest")
+
+roc_lr <- pbp_pred_lr %>% 
+  roc_curve(truth = pass_or_run, .pred_Pass) %>% 
+  mutate(model = "Logistic Regression")
+
+bind_rows(roc_rf, roc_lr) %>% 
+  # Note that autoplot() would also work here!
+  ggplot(aes(x = 1 - specificity, 
+             y = sensitivity, 
+             color = model)) + 
+  geom_path(lwd = 1, alpha = 0.5) +
+  geom_abline(lty = 3) + 
+  theme_bw() +
+  scale_color_manual(values = c("#374785", "#E98074")) +
+  theme(legend.position = "top")
 
