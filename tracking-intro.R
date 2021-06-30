@@ -2,6 +2,19 @@ library(tidyverse)
 library(tidymodels)
 library(vip)
 library(data.table)
+library(ggthemes)
+
+theme_reach <- function() {
+  theme_fivethirtyeight() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 20, hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(size = 13, hjust = 0.5),
+      axis.title.x = element_text(size=16),
+      axis.title.y = element_text(size=16),
+      axis.text = element_text(size = 12)
+    )
+}
 
 games <- read_csv(url("https://raw.githubusercontent.com/tejseth/Big-Data-Bowl-1/master/Data/games.csv"))
 players <- read_csv(url("https://raw.githubusercontent.com/tejseth/Big-Data-Bowl-1/master/Data/players.csv"))
@@ -144,6 +157,21 @@ plays_select <- plays_select %>%
   select(-prev_play)
 
 plays_select$prev_pass[is.na(plays_select$prev_pass)] <- 0
+
+plays_select %>%
+  filter(linemen_width < 8) %>%
+  filter(linemen_width > 5) %>%
+  ggplot(aes(x = pass_or_run, y = width)) +
+  geom_jitter(color = "black", alpha = 0.05) +
+  geom_boxplot(aes(fill = pass_or_run)) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_reach() +
+  labs(y = "Width of Formation",
+       x = "",
+       title = "How Width of Formation Affected Runs and Passes in 2017",
+       caption = "By Tej Seth | @mfbanalytics | Data from Big Data Bowl")
+ggsave('width.png', width = 15, height = 10, dpi = "retina")
+
 
 colSums(is.na(plays_select))
 
