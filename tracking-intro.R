@@ -181,6 +181,8 @@ ggsave('width.png', width = 15, height = 10, dpi = "retina")
 colSums(is.na(plays_select))
 
 ###########################################################################
+set.seed(2014) #go lions
+
 simple_data_model <- plays_select %>%
   filter(!is.na(width)) %>%
   select(pass_or_run, quarter, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
@@ -226,6 +228,7 @@ table("Predictions" = simple_pbp_pred_lr$.pred_class, "Observed" = simple_pbp_pr
   metrics(truth = pass_or_run, .pred_class)
 
 ###########################################################################
+set.seed(2016) #go lions
 
 plays_model_data <- plays_select %>%
   filter(!is.na(width)) %>%
@@ -266,7 +269,6 @@ pbp_pred_lr %>%
   group_by(.pred_class, pass_or_run) %>%
   summarize(perc = n() / nrow(pbp_pred_lr)) %>%
   arrange(-perc)
-#We're getting it right 73.1% of the time
 
 table("Predictions" = pbp_pred_lr$.pred_class, "Observed" = pbp_pred_lr$pass_or_run)
 
@@ -304,9 +306,11 @@ pbp_pred_rf <- predict(pbp_fit_rf, test_data) %>%
 
 `pbp_pred_rf` %>% # Random Forest predictions
   metrics(truth = pass_or_run, .pred_class)
+#73.2
 
 `pbp_pred_lr` %>% # Logistic Regression predictions
   metrics(truth = pass_or_run, .pred_class)
+#73.0%
 
 roc_rf <- pbp_pred_rf %>% 
   roc_curve(truth = pass_or_run, .pred_Pass) %>% 
@@ -328,6 +332,8 @@ bind_rows(roc_rf, roc_lr) %>%
   theme(legend.position = "top")
 
 ############################################################################
+set.seed(1991) #go lions
+
 xg_model_data <- plays_model_data %>%
   mutate(label = ifelse(pass_or_run == "Pass", 1, 0)) %>%
   select(-pass_or_run)
