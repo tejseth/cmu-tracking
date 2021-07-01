@@ -219,7 +219,6 @@ simple_pbp_pred_lr %>%
   group_by(.pred_class, pass_or_run) %>%
   summarize(perc = n() / nrow(simple_pbp_pred_lr)) %>%
   arrange(-perc)
-#They're getting it right 70.8% of the time
 
 table("Predictions" = simple_pbp_pred_lr$.pred_class, "Observed" = simple_pbp_pred_lr$pass_or_run)
 
@@ -333,8 +332,6 @@ xg_model_data <- plays_model_data %>%
   mutate(label = ifelse(pass_or_run == "Pass", 1, 0)) %>%
   select(-pass_or_run)
 
-str(xg_model_data)
-
 nrounds <- 1121
 params <-
   list(
@@ -367,6 +364,23 @@ cv_results <- map_dfr(1:6, function(x) {
   ) %>%
     dplyr::rename(xp = V1)
   
-  cv_data <- bind_cols(test_data, preds) %>% mutate(season = x)
+  cv_data <- bind_cols(test_data, preds) %>% mutate(week = x)
   return(cv_data)
 })
+
+cv_results <- cv_results %>%
+  mutate(actual_result = ifelse(label == 1, "Pass", "Run"),
+         pred = ifelse(xp >= 0.50, "Pass", "Run"),
+         is_right = ifelse(actual_result == pred, 1, 0))
+
+mean(cv_results$is_right)
+
+
+
+
+
+
+
+
+
+
