@@ -47,10 +47,16 @@ for(i in 1:length(ID)){
 
 tracking <- rbindlist(df_tracking)
 
+games_select <- games %>%
+  select(gameId, week)
+
+plays <- plays %>%
+  left_join(games_select, by = c("gameId"))
+
 plays_select <- plays %>%
   filter(isSTPlay == "FALSE") %>%
   mutate(pass_or_run = ifelse(is.na(PassLength), "Run", "Pass")) %>%
-  select(gameId, playId, quarter, GameClock, down, yardsToGo, possessionTeam, 
+  select(gameId, playId,week, quarter, GameClock, down, yardsToGo, possessionTeam, 
          yardlineNumber, offenseFormation, personnel.offense, defendersInTheBox, pass_or_run)
 
 plays_select <- plays_select %>%
@@ -153,7 +159,7 @@ plays_select <- plays_select %>%
 
 plays_select <- plays_select %>%
   mutate(prev_play = lag(pass_or_run)) %>%
-  mutate(prev_pass = ifelse(prev_play == "P", 1, 0)) %>%
+  mutate(prev_pass = ifelse(prev_play == "Pass", 1, 0)) %>%
   select(-prev_play)
 
 plays_select$prev_pass[is.na(plays_select$prev_pass)] <- 0
@@ -172,15 +178,60 @@ plays_select %>%
        caption = "By Tej Seth | @mfbanalytics | Data from Big Data Bowl")
 ggsave('width.png', width = 15, height = 10, dpi = "retina")
 
-
 colSums(is.na(plays_select))
+
+###########################################################################
+simple_data_model <- plays_select %>%
+  filter(!is.na(width)) %>%
+  select(pass_or_run, quarter, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
+         is_shotgun, half_seconds_remaining, score_differential)
+
+simple_data_model$pass_or_run <- as.factor(simple_data_model$pass_or_run)
+
+simple_split_pbp <- initial_split(simple_data_model, 0.75, strata = pass_or_run)
+
+simple_train_data <- training(simple_split_pbp)
+
+simple_test_data <- testing(simple_split_pbp)
+
+simple_pbp_rec <- recipe(pass_or_run ~ ., data = simple_train_data) %>% 
+  step_corr(all_numeric(), threshold = 0.7) %>% 
+  step_center(all_numeric()) %>%  # substract mean from numeric
+  step_zv(all_predictors()) # remove zero-variance predictors
+
+simple_lr_mod <- logistic_reg(mode = "classification") %>% 
+  set_engine("glm")
+
+simple_lr_wflow <- workflow() %>% 
+  add_model(simple_lr_mod) %>% # parsnip model
+  add_recipe(simple_pbp_rec)   # recipe from recipes
+
+simple_pbp_fit_lr <- simple_lr_wflow %>% 
+  fit(data = simple_train_data) # fit the model against the training data
+
+simple_pbp_pred_lr <- predict(simple_pbp_fit_lr, simple_test_data) %>% 
+  # Get probabilities for the class for each observation
+  bind_cols(predict(simple_pbp_fit_lr, simple_test_data, type = "prob")) %>% 
+  # Add back a "truth" column for what the actual play_type was
+  bind_cols(simple_test_data %>% select(pass_or_run))
+
+simple_pbp_pred_lr %>% 
+  group_by(.pred_class, pass_or_run) %>%
+  summarize(perc = n() / nrow(simple_pbp_pred_lr)) %>%
+  arrange(-perc)
+#They're getting it right 70.8% of the time
+
+table("Predictions" = simple_pbp_pred_lr$.pred_class, "Observed" = simple_pbp_pred_lr$pass_or_run)
+
+`simple_pbp_pred_lr` %>% # Simple Logistic Regression predictions
+  metrics(truth = pass_or_run, .pred_class)
 
 ###########################################################################
 
 plays_model_data <- plays_select %>%
   filter(!is.na(width)) %>%
-  select(pass_or_run, quarter, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
-         is_shotgun, is_under_center, is_pistol, is_wildcat,
+  select(pass_or_run, quarter, week, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
+         is_shotgun, is_under_center, is_pistol, is_wildcat, defendersInTheBox,
          half_seconds_remaining, score_differential, width, linemen_width, prev_pass)
 
 plays_model_data$pass_or_run <- as.factor(plays_model_data$pass_or_run)
@@ -277,3 +328,45 @@ bind_rows(roc_rf, roc_lr) %>%
   scale_color_manual(values = c("#374785", "#E98074")) +
   theme(legend.position = "top")
 
+############################################################################
+xg_model_data <- plays_model_data %>%
+  mutate(label = ifelse(pass_or_run == "Pass", 1, 0)) %>%
+  select(-pass_or_run)
+
+str(xg_model_data)
+
+nrounds <- 1121
+params <-
+  list(
+    booster = "gbtree",
+    objective = "binary:logistic",
+    eval_metric = c("error", "logloss"),
+    eta = .015,
+    gamma = 2,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    max_depth = 7,
+    min_child_weight = 0.9
+  )
+
+cv_results <- map_dfr(1:6, function(x) {
+  test_data <- xg_model_data %>%
+    filter(week == x) %>%
+    select(-week)
+  train_data <- xg_model_data %>%
+    filter(week != x) %>%
+    select(-week)
+  
+  full_train <- xgboost::xgb.DMatrix(model.matrix(~ . + 0, data = train_data %>% select(-label)),
+                                     label = train_data$label
+  )
+  xp_model <- xgboost::xgboost(params = params, data = full_train, nrounds = nrounds, verbose = 2)
+  
+  preds <- as.data.frame(
+    matrix(predict(xp_model, as.matrix(test_data %>% select(-label))))
+  ) %>%
+    dplyr::rename(xp = V1)
+  
+  cv_data <- bind_cols(test_data, preds) %>% mutate(season = x)
+  return(cv_data)
+})
