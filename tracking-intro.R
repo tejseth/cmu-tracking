@@ -5,6 +5,8 @@ library(data.table)
 library(ggthemes)
 library(caret)
 library(mlbench)
+library(DescTools)
+library(randomForest)
 
 theme_reach <- function() {
   theme_fivethirtyeight() +
@@ -215,6 +217,24 @@ plays_select$down <- as.factor(plays_select$down)
 
 str(plays_select)
 
+simple_data_model <- plays_select %>%
+  filter(!is.na(width)) %>%
+  select(pass_or_run, quarter, down, yardsToGo, yardlineNumber,
+         is_shotgun, half_seconds_remaining, score_differential)
+
+simple_data_model$pass_or_run <- as.factor(simple_data_model$pass_or_run)
+
+plays_model_data <- plays_select %>%
+  filter(!is.na(width)) %>%
+  select(pass_or_run, quarter, week, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
+         is_shotgun, is_under_center, is_pistol, is_wildcat, defendersInTheBox,
+         half_seconds_remaining, score_differential, width, linemen_width, prev_pass,
+         linemen_height, rb_deep, is_fullback)
+
+plays_model_data$pass_or_run <- as.factor(plays_model_data$pass_or_run)
+
+colSums(is.na(plays_model_data))
+
 ############################ Using Caret Package ##############################
 
 set.seed(123)
@@ -232,51 +252,56 @@ summary(model)
 probabilities <- model %>% predict(test.data, type = "response")
 predicted.classes <- ifelse(probabilities > 0.5, "Run", "Pass")
 
+BrierScore(model)
+#Simple model's brier score is 0.198
+
 mean(predicted.classes == test.data$pass_or_run)
+#Simple model's prediction rate is 72.6%
 
 set.seed(234)
 
-training.samples <- plays_model_data$pass_or_run %>% 
-  createDataPartition(p = 0.8, list = FALSE)
+rf_split <- initial_split(plays_model_data, strata = pass_or_run)
+rf_train <- training(rf_split)
+rf_test <- testing(rf_split)
 
-train.data  <- plays_model_data[training.samples, ]
-test.data <- plays_model_data[-training.samples, ]
+rf_rec <- recipe(pass_or_run ~ ., data = rf_train)
 
-model <- glm(pass_or_run ~ num_rb + num_wr + num_te + is_shotgun + 
-               is_under_center + is_pistol + is_wildcat + defendersInTheBox + width + 
-                linemen_width + prev_pass + linemen_height + rb_deep + is_fullback +
-               yardsToGo + yardlineNumber + score_differential, data = train.data, family = binomial)
+rf_prep <- prep(rf_rec)
+juiced <- juice(rf_prep)
 
-summary(model)
+tune_spec <- rand_forest(
+  mtry = tune(),
+  trees = 1000,
+  min_n = tune()
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
 
-probabilities <- model %>% predict(test.data, type = "response")
-predicted.classes <- ifelse(probabilities > 0.5, "Run", "Pass")
+tune_wf <- workflow() %>%
+  add_recipe(rf_rec) %>%
+  add_model(tune_spec)
 
-mean(predicted.classes == test.data$pass_or_run)
+set.seed(345)
+rf_folds <- vfold_cv(rf_train)
 
-rf_model_data <- plays_model_data %>%
-  select(pass_or_run, num_rb, num_wr, num_te, is_shotgun, is_under_center, is_pistol, is_wildcat, 
-         defendersInTheBox, width, linemen_width, prev_pass, linemen_height, rb_deep, 
-         is_fullback, yardsToGo, yardlineNumber, score_differential)
+set.seed(345)
+tune_res <- tune_grid(
+  tune_wf,
+  resamples = rf_folds,
+  grid = 10
+)
 
-set.seed(998)
-inTraining <- createDataPartition(rf_model_data$pass_or_run, p = .75, list = FALSE)
-training <- rf_model_data[ inTraining,]
-testing  <- rf_model_data[-inTraining,]
+tune_res
 
-fitControl <- trainControl(## 10-fold CV
-  method = "repeatedcv",
-  number = 10,
-  ## repeated ten times
-  repeats = 10)
+simple_rf <- randomForest(pass_or_run ~ ., data = rf_train, ntree = 1000, importance= TRUE)
 
-set.seed(825)
+importance <- as.data.frame(simple_rf$importance)
 
-gbmFit1 <- train(pass_or_run ~ ., data = training, 
-                 method = "gbm", 
-                 trControl = fitControl,
-                 ## This last option is actually one
-                 ## for gbm() that passes through
-                 verbose = FALSE)
-gbmFit1
+rf_test_probs <- predict(simple_rf, rf_test, type = "prob")
+rf_test_preds <- predict(simple_rf, rf_test, type = "response")
+
+confusionMatrix(rf_test_preds, rf_test$pass_or_run)
+
+BrierScore(rf_test_probs, as.numeric(rf_test$pass_or_run) - 1)
+
 
