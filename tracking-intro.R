@@ -7,6 +7,8 @@ library(caret)
 library(mlbench)
 library(DescTools)
 library(randomForest)
+library(nflfastR)
+library(ggimage)
 
 theme_reach <- function() {
   theme_fivethirtyeight() +
@@ -131,7 +133,7 @@ player_positions <- players %>%
   select(nflId, PositionAbbr)
 
 #join player positions to tracking data by nflid
-tracking <- inner_join(player_positions, tracking,
+tracking <- left_join(player_positions, tracking,
                        by = c("nflId" = "nflId"))
 
 offense_positions <- c("C", "FB", "G", "QB", "RB", "TE", "WR", "T")
@@ -140,7 +142,8 @@ width_of_form <- tracking %>%
   filter(event == "ball_snap") %>%
   filter(PositionAbbr %in% offense_positions) %>%
   group_by(gameId, playId) %>%
-  summarize(width = max(y) - min(y))
+  summarize(width = max(y) - min(y),
+            width_sd = sd(y, na.rm = T))
 
 width_of_form$gameId <- as.character(width_of_form$gameId)
 
@@ -157,7 +160,8 @@ linemen_width <- tracking %>%
   filter(event == "ball_snap") %>%
   group_by(gameId, playId) %>%
   summarise(linemen_width = max(y)- min(y), 
-            linemen_height = max(x) - min(x))
+            linemen_height = max(x) - min(x),
+            linemen_sd = sd(y))
 
 plays_select <- plays_select %>%
   left_join(linemen_width, by = c("gameId", "playId"))
@@ -170,15 +174,15 @@ plays_select <- plays_select %>%
 plays_select$prev_pass[is.na(plays_select$prev_pass)] <- 0
 
 plays_select %>%
-  filter(linemen_height < 2) %>%
-  ggplot(aes(x = pass_or_run, y = linemen_height)) +
+  filter(linemen_sd < 3) %>% 
+  ggplot(aes(x = pass_or_run, y = linemen_sd)) +
   geom_jitter(color = "black", alpha = 0.05) +
   geom_boxplot(aes(fill = pass_or_run)) +
   scale_fill_brewer(palette = "Set2") +
   theme_reach() +
-  labs(y = "Height of Offensive Line",
+  labs(y = "SD of Offensive Line",
        x = "",
-       title = "How Height of Offensive Line Affected Runs and Passes in 2017")
+       title = "How Standard Dev. of the Offensive Line Affected Runs and Passes in 2017")
 ggsave('width.png', width = 15, height = 10, dpi = "retina")
 
 colSums(is.na(plays_select))
@@ -215,6 +219,29 @@ plays_select$is_wildcat <- as.factor(plays_select$is_wildcat)
 plays_select$prev_pass <- as.factor(plays_select$prev_pass)
 plays_select$down <- as.factor(plays_select$down)
 
+ball_los <- tracking %>%
+  filter(frame.id == 1) %>%
+  select(gameId, playId, y) 
+names(ball_los)[3] <- c("los")
+
+ball_los %>% 
+  filter(los > 21) %>%
+  filter(los < 32) %>%
+  ggplot(aes(x = los)) +
+  geom_density(fill = "darkgreen") +
+  theme_bw() +
+  scale_x_continuous(breaks = pretty_breaks(n = 15))
+
+ball_los <- ball_los %>%
+  mutate(hash = case_when(
+    los <= 24.5 ~ "L",
+    los >= 29 ~ "R",
+    TRUE ~ "C"
+  ))
+
+plays <- plays %>%
+  left_join(ball_los, by = c("gameId", "playId"))
+
 str(plays_select)
 
 simple_data_model <- plays_select %>%
@@ -224,12 +251,14 @@ simple_data_model <- plays_select %>%
 
 simple_data_model$pass_or_run <- as.factor(simple_data_model$pass_or_run)
 
-plays_model_data <- plays_select %>%
-  filter(!is.na(width)) %>%
+plays_join <- plays_select %>%
+  filter(!is.na(width))
+
+plays_model_data <- plays_join %>%
   select(pass_or_run, quarter, week, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
          is_shotgun, is_under_center, is_pistol, is_wildcat, defendersInTheBox,
          half_seconds_remaining, score_differential, width, linemen_width, prev_pass,
-         linemen_height, rb_deep, is_fullback)
+         linemen_height, rb_deep, is_fullback, width_sd, linemen_sd)
 
 plays_model_data$pass_or_run <- as.factor(plays_model_data$pass_or_run)
 
@@ -245,7 +274,8 @@ training.samples <- simple_data_model$pass_or_run %>%
 train.data  <- simple_data_model[training.samples, ]
 test.data <- simple_data_model[-training.samples, ]
 
-model <- glm(pass_or_run ~., data = train.data, family = binomial)
+model <- glm(pass_or_run ~ ., 
+             data = train.data, family = binomial)
 
 summary(model)
 
@@ -291,17 +321,141 @@ tune_res <- tune_grid(
   grid = 10
 )
 
-tune_res
+tune_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE, size = 5) +
+  theme_bw() +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
 
-simple_rf <- randomForest(pass_or_run ~ ., data = rf_train, ntree = 1000, importance= TRUE)
+rf_grid <- grid_regular(
+  mtry(range = c(0, 10)),
+  min_n(range = c(25, 35)),
+  levels = 5
+)
+
+rf_grid
+
+set.seed(456)
+regular_res <- tune_grid(
+  tune_wf,
+  resamples = rf_folds,
+  grid = rf_grid
+)
+
+best_auc <- select_best(regular_res, "roc_auc")
+
+final_rf <- finalize_model(
+  tune_spec,
+  best_auc
+)
+
+final_rf
+
+library(vip)
+
+final_rf %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(juiced$pass_or_run ~ .,
+      data = juiced %>% select(-pass_or_run)
+  ) %>%
+  vip(geom = "point") +
+  theme_bw()
+
+final_wf <- workflow() %>%
+  add_recipe(rf_rec) %>%
+  add_model(final_rf)
+
+final_res <- final_wf %>%
+  last_fit(rf_split)
+
+final_res %>%
+  collect_metrics()
+
+test_preds <- final_res %>%
+  collect_predictions() %>%
+  bind_cols(rf_test)
+
+simple_rf <- randomForest(pass_or_run ~ ., data = rf_train, ntree = 1000, 
+                          importance= TRUE, mtry = 2, min_n = 25)
 
 importance <- as.data.frame(simple_rf$importance)
 
 rf_test_probs <- predict(simple_rf, rf_test, type = "prob")
 rf_test_preds <- predict(simple_rf, rf_test, type = "response")
 
-confusionMatrix(rf_test_preds, rf_test$pass_or_run)
+all_probs <- predict(simple_rf, plays_model_data, type = "prob")
+all_preds <- predict(simple_rf, rf_test, type = "response")
 
-BrierScore(rf_test_probs, as.numeric(rf_test$pass_or_run) - 1)
+probs_and_preds <- cbind(plays_join, all_probs, all_preds)
+
+probs_and_preds <- probs_and_preds %>%
+  mutate(is_pass = ifelse(pass_or_run == "Pass", 1, 0),
+         proe = is_pass - Pass)
+
+proe_stats <- probs_and_preds %>%
+  group_by(possessionTeam) %>%
+  summarize(avg_proe = 100*mean(proe, na.rm = T)) %>%
+  left_join(teams_colors_logos, by = c("possessionTeam" = "team_abbr")) %>%
+  arrange(-avg_proe)
+
+proe_stats %>%
+  mutate(team = fct_reorder(possessionTeam, -avg_proe)) %>%
+  ggplot(aes(x = team, y = avg_proe)) +
+  geom_bar(aes(fill = team_color, color = team_color2), stat = "identity", alpha = 0.9) +
+  geom_image(aes(x = team, y = ifelse(avg_proe > 0, avg_proe + 0.5, avg_proe - 0.5), image = team_logo_espn),
+             asp = 16/9, size = 0.035) +
+  scale_color_identity(aesthetics = c("fill", "color")) +
+  theme_reach() +
+  labs(x = "Team",
+       y = "Pass Rate Over Expected",
+       title = "Each Team's Pass Rate Over Expcted, 2017",
+       subtitle = "Data from the Big Data Bowl, Week 1-6") +
+  theme(axis.text.x = element_blank(),
+        panel.grid.major.x = element_line(size = 0.1, colour = "gray")) +
+  scale_y_continuous(breaks = pretty_breaks(n = 10))
+ggsave('tracking-1.png', width = 15, height = 10, dpi = "retina")
+  
+
+expected_pass <- probs_and_preds %>%
+  filter(Pass >= 0.5) %>%
+  group_by(possessionTeam) %>%
+  summarize(pass_rate = mean(is_pass))
+
+expected_run <- probs_and_preds %>%
+  filter(Run >= 0.5) %>%
+  group_by(possessionTeam) %>%
+  summarize(run_rate = 1 - mean(is_pass))
+
+expected_all <- expected_pass %>%
+  left_join(expected_run, by = c("possessionTeam")) %>%
+  left_join(teams_colors_logos, by = c("possessionTeam" = "team_abbr"))
+
+expected_all %>%
+  ggplot(aes(x = pass_rate, y = run_rate)) +
+  geom_image(aes(image = team_logo_espn), asp = 16/9, size = 0.05) +
+  theme_reach() +
+  geom_hline(yintercept = mean(expected_all$run_rate), linetype = "dashed") +
+  geom_vline(xintercept = mean(expected_all$pass_rate), linetype = "dashed") +
+  labs(x = "Pass Rate When Expected to Pass",
+       y = "Run Rate When Expected to Run",
+       title = "Team Predictability in 2017 on Runs and Passes",
+       subtitle = "Data from the Big Data Bowl, Week 1-6") +
+  scale_y_continuous(breaks = pretty_breaks(n = 10)) +
+  scale_x_continuous(breaks = pretty_breaks(n = 10)) +
+  annotate("text", x = 0.915, y = 0.935, label = "Pass Predictable \n Run Predictable") +
+  annotate("text", x = 0.915, y = 0.745, label = "Pass Predictable \n Run Unredictable") +
+  annotate("text", x = 0.725, y = 0.745, label = "Pass Unredictable \n Run Unredictable") +
+  annotate("text", x = 0.725, y = 0.935, label = "Pass Unredictable \n Run Unredictable") 
+ggsave('tracking-2.png', width = 15, height = 10, dpi = "retina")
+
+confusionMatrix(rf_test_preds, rf_test$pass_or_run)
 
 
