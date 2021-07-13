@@ -306,6 +306,7 @@ plays_select$prev_pass[is.na(plays_select$prev_pass)] <- 0
 
 plays_select %>%
   filter(linemen_sd < 3) %>% 
+  filter(linemen_sd > 1.8) %>%
   ggplot(aes(x = pass_or_run, y = linemen_sd)) +
   geom_jitter(color = "black", alpha = 0.05) +
   geom_boxplot(aes(fill = pass_or_run)) +
@@ -313,7 +314,7 @@ plays_select %>%
   theme_reach() +
   labs(y = "SD of Offensive Line",
        x = "",
-       title = "How Standard Dev. of the Offensive Line Affected Runs and Passes in 2017")
+       title = "How Standard Deviation of the Offensive Line Affected Runs and Passes in 2017")
 ggsave('width.png', width = 15, height = 10, dpi = "retina")
 
 colSums(is.na(plays_select))
@@ -350,18 +351,6 @@ plays_select$is_wildcat <- as.factor(plays_select$is_wildcat)
 plays_select$prev_pass <- as.factor(plays_select$prev_pass)
 plays_select$down <- as.factor(plays_select$down)
 
-ball_los <- tracking %>%
-  filter(frame.id == 1, displayName == "football") %>%
-  select(gameId, playId, y) 
-names(ball_los)[3] <- c("los")
-
-ball_los <- ball_los %>%
-  mutate(hash = case_when(
-    los <= 24.5 ~ "L",
-    los >= 29 ~ "R",
-    TRUE ~ "C"
-  ))
-
 los <- tracking %>%
   filter(frame.id == 1, displayName == "football") %>% 
   select(gameId, playId, x) 
@@ -392,6 +381,54 @@ plays_select <- plays_select %>%
 plays_select <- plays_select %>%
   left_join(ball_los, by = c("gameId", "playId"))
 
+plays_select$receiver_offline[is.na(plays_select$receiver_offline)] <- 0
+
+ball_coords <- tracking %>%
+  filter(displayName == "football") %>%
+  filter(frame.id == 1) %>%
+  select(gameId, playId, x, y) %>%
+  rename(ball_x_snap = x,
+         ball_y_snap = y)
+
+tracking <- tracking %>%
+  left_join(ball_coords, by = c("gameId", "playId"))
+
+tracking <- tracking %>%
+  select(-ball_x_snap.x, -ball_y_snap.x) %>%
+  rename(ball_x_snap = ball_x_snap.y,
+         ball_y_snap = ball_y_snap.y)
+
+tight_ends <- tracking %>%
+  filter(frame.id == 1)%>%
+  filter(PositionAbbr == "TE") %>%
+  mutate(ecl_dist = sqrt((x - ball_x_snap)^2 + (y = ball_y_snap))) %>%
+  group_by(gameId, playId) %>%
+  summarize(min_ecl_dist = min(ecl_dist))
+
+tight_ends <- tight_ends %>%
+  mutate(te_inline = ifelse(min_ecl_dist < 5.3, 1, 0)) %>%
+  select(gameId, playId, te_inline)
+
+plays_select <- plays_select %>%
+  left_join(tight_ends, by = c("gameId", "playId"))
+
+plays_select$te_inline[is.na(plays_select$te_inline)] <- 0
+plays_select$te_inline <- as.factor(plays_select$te_inline)
+
+man_in_motion <- tracking %>%
+  filter(event == "man_in_motion")
+  
+man_in_motion <- unique(man_in_motion[c("gameId", "playId")])
+
+man_in_motion <- man_in_motion %>%
+  select(gameId, playId) %>%
+  mutate(is_motion = 1)
+
+plays_select <- plays_select %>%
+  left_join(man_in_motion, by = c("gameId", "playId"))
+
+plays_select$is_motion[is.na(plays_select$is_motion)] <- 0
+
 str(plays_select)
 
 simple_data_model <- plays_select %>%
@@ -414,7 +451,7 @@ plays_model_data <- plays_join %>%
   select(pass_or_run, quarter, week, num_rb, num_wr, num_te,
          is_shotgun, is_under_center, is_pistol, is_wildcat, defendersInTheBox,
          width, linemen_width, prev_pass, linemen_height, rb_deep, is_fullback, 
-         width_sd, linemen_sd, receiver_offline, simple_xp) 
+         width_sd, linemen_sd, receiver_offline, te_inline, is_motion, simple_xp) 
 
 colSums(is.na(plays_model_data))
 
