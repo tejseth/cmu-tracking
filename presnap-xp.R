@@ -187,8 +187,14 @@ plays <- plays %>%
 plays_select <- plays %>%
   filter(isSTPlay == "FALSE") %>%
   mutate(pass_or_run = ifelse(is.na(PassLength), "Run", "Pass")) %>%
-  select(gameId, playId, week, quarter, GameClock, down, yardsToGo, possessionTeam, 
+  select(gameId, playId, playDescription, week, quarter, GameClock, down, yardsToGo, possessionTeam, 
          yardlineNumber, offenseFormation, personnel.offense, defendersInTheBox, pass_or_run)
+
+plays_select <- plays_select %>%
+  mutate(sacked = ifelse(grepl("sacked", plays_select$playDescription), TRUE, FALSE))
+
+plays_select <- plays_select %>%
+  mutate(pass_or_run = ifelse(sacked == TRUE, "Pass", pass_or_run))
 
 plays_select <- plays_select %>%
   mutate(len = nchar(personnel.offense)) %>%
@@ -258,7 +264,7 @@ player_positions <- players %>%
   select(nflId, PositionAbbr)
 
 #join player positions to tracking data by nflid
-tracking <- left_join(player_positions, tracking,
+tracking <- right_join(player_positions, tracking,
                       by = c("nflId" = "nflId"))
 
 offense_positions <- c("C", "FB", "G", "QB", "RB", "TE", "WR", "T")
@@ -345,17 +351,9 @@ plays_select$prev_pass <- as.factor(plays_select$prev_pass)
 plays_select$down <- as.factor(plays_select$down)
 
 ball_los <- tracking %>%
-  filter(frame.id == 1) %>%
+  filter(frame.id == 1, displayName == "football") %>%
   select(gameId, playId, y) 
 names(ball_los)[3] <- c("los")
-
-ball_los %>% 
-  filter(los > 21) %>%
-  filter(los < 32) %>%
-  ggplot(aes(x = los)) +
-  geom_density(fill = "darkgreen") +
-  theme_bw() +
-  scale_x_continuous(breaks = pretty_breaks(n = 15))
 
 ball_los <- ball_los %>%
   mutate(hash = case_when(
@@ -364,7 +362,34 @@ ball_los <- ball_los %>%
     TRUE ~ "C"
   ))
 
-plays <- plays %>%
+los <- tracking %>%
+  filter(frame.id == 1, displayName == "football") %>% 
+  select(gameId, playId, x) 
+names(los)[3] <- c("los")
+
+tracking <- tracking %>% 
+  left_join(los, by = c("gameId", "playId"))
+
+#Distance from LOS column on TRACKING DATA
+tracking <- tracking %>%
+  mutate(distFromLos = abs(x - los))
+
+#Finding Receiver Furthest From line at Snap on each play
+deepest_players <- tracking %>%
+  filter(frame.id == 1)%>%
+  filter(PositionAbbr == "WR") %>%
+  group_by(gameId, playId)%>%
+  filter(distFromLos == max(distFromLos))
+
+#Distance from LOS of player farthest from LOS
+max_depth_at_snap <- deepest_players %>%
+  select(gameId, playId, distFromLos)
+names(max_depth_at_snap)[3] <- c("receiver_offline")
+
+plays_select <- plays_select %>%
+  left_join(max_depth_at_snap, by = c("gameId", "playId"))
+
+plays_select <- plays_select %>%
   left_join(ball_los, by = c("gameId", "playId"))
 
 str(plays_select)
@@ -389,7 +414,7 @@ plays_model_data <- plays_join %>%
   select(pass_or_run, quarter, week, num_rb, num_wr, num_te,
          is_shotgun, is_under_center, is_pistol, is_wildcat, defendersInTheBox,
          width, linemen_width, prev_pass, linemen_height, rb_deep, is_fullback, 
-         width_sd, linemen_sd, simple_xp) 
+         width_sd, linemen_sd, receiver_offline, simple_xp) 
 
 colSums(is.na(plays_model_data))
 
@@ -466,7 +491,7 @@ tune_res %>%
 
 rf_grid <- grid_regular(
   mtry(range = c(0, 10)),
-  min_n(range = c(25, 35)),
+  min_n(range = c(1, 10)),
   levels = 5
 )
 
