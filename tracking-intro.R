@@ -62,7 +62,7 @@ plays <- plays %>%
 plays_select <- plays %>%
   filter(isSTPlay == "FALSE") %>%
   mutate(pass_or_run = ifelse(is.na(PassLength), "Run", "Pass")) %>%
-  select(gameId, playId,week, quarter, GameClock, down, yardsToGo, possessionTeam, 
+  select(gameId, playId, week, quarter, GameClock, down, yardsToGo, possessionTeam, 
          yardlineNumber, offenseFormation, personnel.offense, defendersInTheBox, pass_or_run)
 
 plays_select <- plays_select %>%
@@ -174,15 +174,15 @@ plays_select <- plays_select %>%
 plays_select$prev_pass[is.na(plays_select$prev_pass)] <- 0
 
 plays_select %>%
-  filter(linemen_sd < 3) %>% 
-  ggplot(aes(x = pass_or_run, y = linemen_sd)) +
+  filter(width < 3) %>% 
+  ggplot(aes(x = pass_or_run, y = linemen_width)) +
   geom_jitter(color = "black", alpha = 0.05) +
   geom_boxplot(aes(fill = pass_or_run)) +
   scale_fill_brewer(palette = "Set2") +
   theme_reach() +
-  labs(y = "SD of Offensive Line",
+  labs(y = "Width of Formation",
        x = "",
-       title = "How Standard Dev. of the Offensive Line Affected Runs and Passes in 2017")
+       title = "How Width of the Formation Affected Runs and Passes in 2017")
 ggsave('width.png', width = 15, height = 10, dpi = "retina")
 
 colSums(is.na(plays_select))
@@ -246,13 +246,14 @@ str(plays_select)
 
 simple_data_model <- plays_select %>%
   filter(!is.na(width)) %>%
-  select(pass_or_run, quarter, down, yardsToGo, yardlineNumber,
-         is_shotgun, half_seconds_remaining, score_differential)
+  select(pass_or_run, quarter, down, yardsToGo, yardlineNumber, 
+         half_seconds_remaining, score_differential)
 
 simple_data_model$pass_or_run <- as.factor(simple_data_model$pass_or_run)
 
 plays_join <- plays_select %>%
-  filter(!is.na(width))
+  filter(!is.na(width)) %>%
+  distinct()
 
 plays_model_data <- plays_join %>%
   select(pass_or_run, quarter, week, down, yardsToGo, yardlineNumber, num_rb, num_wr, num_te,
@@ -286,7 +287,7 @@ BrierScore(model)
 #Simple model's brier score is 0.198
 
 mean(predicted.classes == test.data$pass_or_run)
-#Simple model's prediction rate is 72.6%
+#Simple model's prediction rate is 63.2%
 
 set.seed(234)
 
@@ -388,11 +389,26 @@ simple_rf <- randomForest(pass_or_run ~ ., data = rf_train, ntree = 1000,
 
 importance <- as.data.frame(simple_rf$importance)
 
+mydf <- cbind(rownames(importance), importance)
+rownames(mydf) <- NULL
+colnames(mydf) <- c("variable", "Pass","Run","MeanDecreaseAccuracy", "MeanDecreaseGini")
+
+mydf %>%
+  filter(MeanDecreaseAccuracy > 0.005) %>%
+  mutate(type = fct_reorder(variable, MeanDecreaseAccuracy)) %>%
+  ggplot(aes(x = MeanDecreaseAccuracy, y = type)) +
+  geom_bar(stat = "identity", fill = "darkred", color = "darkblue", alpha = 0.9) +
+  theme_reach() +
+  labs(y = "Variable",
+       x = "Mean Decrease in Accuracy",
+       title = "Pass or Run Variable Importance")
+ggsave('tracking-vip.png', width = 15, height = 10, dpi = "retina")
+
 rf_test_probs <- predict(simple_rf, rf_test, type = "prob")
 rf_test_preds <- predict(simple_rf, rf_test, type = "response")
 
 all_probs <- predict(simple_rf, plays_model_data, type = "prob")
-all_preds <- predict(simple_rf, rf_test, type = "response")
+all_preds <- predict(simple_rf, plays_model_data, type = "response")
 
 probs_and_preds <- cbind(plays_join, all_probs, all_preds)
 
@@ -402,7 +418,8 @@ probs_and_preds <- probs_and_preds %>%
 
 proe_stats <- probs_and_preds %>%
   group_by(possessionTeam) %>%
-  summarize(avg_proe = 100*mean(proe, na.rm = T)) %>%
+  summarize(avg_proe = 100*mean(proe, na.rm = T),
+            brier = mean((Pass-probs_and_preds$is_pass)^2)) %>%
   left_join(teams_colors_logos, by = c("possessionTeam" = "team_abbr")) %>%
   arrange(-avg_proe)
 
@@ -422,40 +439,83 @@ proe_stats %>%
         panel.grid.major.x = element_line(size = 0.1, colour = "gray")) +
   scale_y_continuous(breaks = pretty_breaks(n = 10))
 ggsave('tracking-1.png', width = 15, height = 10, dpi = "retina")
+
+proe_stats %>%
+  mutate(team = fct_reorder(possessionTeam, brier)) %>%
+  ggplot(aes(x = team, y = brier)) +
+  geom_bar(aes(fill = team_color, color = team_color2), stat = "identity", alpha = 0.9) +
+  #geom_image(aes(x = team, y = brier + 0.01, image = team_logo_espn), asp = 16/9, size = 0.035) +
+  scale_color_identity(aesthetics = c("fill", "color")) +
+  theme_reach() +
+  labs(x = "Team",
+       y = "Brier Score",
+       title = "Each Team's Expected Pass Brier Score, 2017",
+       subtitle = "Data from the Big Data Bowl, Week 1-6") +
+  theme(axis.text.x = element_blank(),
+        panel.grid.major.x = element_line(size = 0.1, colour = "gray")) +
+  scale_y_continuous(breaks = pretty_breaks(n = 10), limits = c(0.25, 0.41))
   
 
 expected_pass <- probs_and_preds %>%
   filter(Pass >= 0.5) %>%
   group_by(possessionTeam) %>%
-  summarize(pass_rate = mean(is_pass))
+  summarize(pass_rate = mean(is_pass),
+            pass_brier = mean((Pass - probs_and_preds$is_pass)^2))
 
 expected_run <- probs_and_preds %>%
   filter(Run >= 0.5) %>%
   group_by(possessionTeam) %>%
-  summarize(run_rate = 1 - mean(is_pass))
+  summarize(run_rate = 1 - mean(is_pass),
+            run_brier = mean((Run - (1-probs_and_preds$is_pass))^2))
 
 expected_all <- expected_pass %>%
   left_join(expected_run, by = c("possessionTeam")) %>%
   left_join(teams_colors_logos, by = c("possessionTeam" = "team_abbr"))
 
 expected_all %>%
-  ggplot(aes(x = pass_rate, y = run_rate)) +
+  ggplot(aes(x = pass_brier, y = run_brier)) +
   geom_image(aes(image = team_logo_espn), asp = 16/9, size = 0.05) +
   theme_reach() +
-  geom_hline(yintercept = mean(expected_all$run_rate), linetype = "dashed") +
-  geom_vline(xintercept = mean(expected_all$pass_rate), linetype = "dashed") +
-  labs(x = "Pass Rate When Expected to Pass",
-       y = "Run Rate When Expected to Run",
+  geom_hline(yintercept = mean(expected_all$run_brier), linetype = "dashed") +
+  geom_vline(xintercept = mean(expected_all$pass_brier), linetype = "dashed") +
+  labs(x = "Pass Brier Score",
+       y = "Run Brier Score",
        title = "Team Predictability in 2017 on Runs and Passes",
        subtitle = "Data from the Big Data Bowl, Week 1-6") +
   scale_y_continuous(breaks = pretty_breaks(n = 10)) +
   scale_x_continuous(breaks = pretty_breaks(n = 10)) +
   annotate("text", x = 0.915, y = 0.935, label = "Pass Predictable \n Run Predictable") +
-  annotate("text", x = 0.915, y = 0.745, label = "Pass Predictable \n Run Unredictable") +
-  annotate("text", x = 0.725, y = 0.745, label = "Pass Unredictable \n Run Unredictable") +
-  annotate("text", x = 0.725, y = 0.935, label = "Pass Unredictable \n Run Unredictable") 
+  annotate("text", x = 0.915, y = 0.745, label = "Pass Predictable \n Run Unpredictable") +
+  annotate("text", x = 0.725, y = 0.745, label = "Pass Unpredictable \n Run Unpredictable") +
+  annotate("text", x = 0.725, y = 0.935, label = "Pass Unpredictable \n Run Unpredictable") 
 ggsave('tracking-2.png', width = 15, height = 10, dpi = "retina")
 
 confusionMatrix(rf_test_preds, rf_test$pass_or_run)
 
+proe_stats <- proe_stats %>%
+  mutate(posteam = ifelse(possessionTeam == "OAK", "LV", possessionTeam))
+
+epa_stats <- pbp_17 %>%
+  filter(week < 7) %>%
+  filter(pass == 1 | rush == 1) %>%
+  filter(!is.na(posteam)) %>%
+  group_by(posteam) %>%
+  summarize(avg_epa = mean(epa, na.rm = T)) %>%
+  left_join(proe_stats, by = c("posteam"))
+
+cor(epa_stats$brier, epa_stats$avg_epa)
+
+epa_stats %>%
+  ggplot(aes(x = brier, y = avg_epa)) +
+  geom_image(aes(image = team_logo_espn), asp = 16/9, size = 0.05) +
+  geom_smooth(method = "lm", color = "black") +
+  theme_reach() +
+  geom_hline(yintercept = mean(expected_all$avg_epa), linetype = "dashed") +
+  geom_vline(xintercept = mean(expected_all$brier), linetype = "dashed") +
+  labs(x = "Brier Score",
+       y = "EPA/Play",
+       title = "How Predictability Affects a Team's Offensive EPA/Play",
+       subtitle = "Data from the Big Data Bowl, Week 1-6") +
+  scale_y_continuous(breaks = pretty_breaks(n = 10)) +
+  scale_x_reverse(breaks = pretty_breaks(n = 10)) 
 

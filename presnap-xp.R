@@ -9,6 +9,7 @@ library(DescTools)
 library(randomForest)
 library(nflfastR)
 library(ggimage)
+library(lme4)
 
 theme_reach <- function() {
   theme_fivethirtyeight() +
@@ -310,7 +311,7 @@ plays_select %>%
   filter(linemen_sd < 3) %>% 
   filter(linemen_sd > 1.8) %>%
   ggplot(aes(x = pass_or_run, y = linemen_sd)) +
-  geom_jitter(color = "black", alpha = 0.05) +
+  geom_violin() +
   geom_boxplot(aes(fill = pass_or_run)) +
   scale_fill_brewer(palette = "Set2") +
   theme_reach() +
@@ -443,7 +444,8 @@ plays_join <- plays_join %>%
   left_join(pbp_rp_xp_select, by = c("gameId"  = "old_game_id", "playId" = "play_id"))
 
 plays_join <- plays_join %>%
-  filter(!is.na(simple_xp)) 
+  filter(!is.na(simple_xp)) %>% 
+  arrange(week)
 
 plays_model_data <- plays_join %>%
   select(pass_or_run, quarter, week, num_rb, num_wr, num_te,
@@ -531,8 +533,8 @@ tune_res %>%
   scale_x_continuous(breaks = scales::pretty_breaks(n = 20))
 
 rf_grid <- grid_regular(
-  mtry(range = c(3, 11)),
-  min_n(range = c(0, 6)),
+  mtry(range = c(0, 6)),
+  min_n(range = c(8, 14)),
   levels = 5
 )
 
@@ -546,6 +548,8 @@ regular_res <- tune_grid(
 )
 
 best_auc <- select_best(regular_res, "roc_auc")
+
+best_auc
 
 final_rf <- finalize_model(
   tune_spec,
@@ -579,7 +583,34 @@ test_preds <- final_res %>%
   bind_cols(rf_test)
 
 simple_rf <- randomForest(pass_or_run ~ ., data = rf_train, ntree = 1000, 
-                          importance= TRUE, mtry = 5, min_n = 3)
+                          importance= TRUE, mtry = 3, min_n = 12)
+
+weeks <- c(1, 2, 3, 4, 5, 6)
+
+cv_results <- map_dfr(weeks, function(x) {
+  test_data <- plays_model_data %>%
+    filter(week == x) %>%
+    select(-week)
+  train_data <- plays_model_data %>%
+    filter(week != x) %>%
+    select(-week)
+  
+  simple_rf <- randomForest(pass_or_run ~ ., data = train_data, ntree = 1000)
+  
+preds <- 
+   predict(simple_rf, test_data %>% select(-pass_or_run), type = "prob")[,2] %>%
+    as.numeric()
+  
+  cv_data <- test_data %>%
+    mutate(xp = preds,
+           week = x)
+  return(cv_data)
+})
+
+cv_results <- cv_results %>%
+  mutate(pred_pass = as.factor(ifelse(xp > 0.500, 1, 0)))
+
+mean(cv_results$pass_or_run == cv_results$pred_pass) #75.2% accuracy
 
 importance <- as.data.frame(simple_rf$importance)
 
@@ -596,23 +627,21 @@ mydf %>%
   labs(y = "Variable",
        x = "Mean Decrease in Accuracy",
        title = "Pass or Run Variable Importance")
+ggsave('tracking-1.png', width = 15, height = 10, dpi = "retina")
 
-rf_test_probs <- predict(simple_rf, rf_test, type = "prob")
-rf_test_preds <- predict(simple_rf, rf_test, type = "response")
+preds_join <- cv_results %>%
+  select(xp, pred_pass)
 
-mean(rf_test_preds == rf_test$pass_or_run) #86.9% accuracy
+probs_and_preds <- cbind(plays_join, preds_join)
 
-all_probs <- predict(simple_rf, plays_model_data, type = "prob")
-all_preds <- predict(simple_rf, plays_model_data, type = "response")
-
-probs_and_preds <- cbind(plays_join, all_probs, all_preds)
+colSums(is.na(probs_and_preds))
+str(probs_and_preds)
 
 probs_and_preds <- probs_and_preds %>%
-  select(-`0`) %>%
-  rename(xpass = `1`) %>%
-  mutate(is_pass = ifelse(pass_or_run == "Pass", 1, 0),
-         proe = is_pass - xpass)
+  mutate(is_pass = ifelse(pass_or_run == 'Pass', 1, 0),
+         proe = is_pass - xp)
 
+mean((probs_and_preds$xp - probs_and_preds$is_pass)^2) #0.16
 
 probs_and_preds <- probs_and_preds %>%
   mutate(bucket = case_when(
@@ -632,7 +661,7 @@ bucket_stats <- probs_and_preds %>%
   group_by(bucket) %>%
   summarize(count = n(),
             avg_proe = round(100*mean(proe, na.rm = T), 3),
-            brier_score = mean((xpass - is_pass)^2))
+            brier_score = mean((xp - is_pass)^2))
 
 bucket_stats %>%
   mutate(bucket = fct_reorder(bucket, -brier_score)) %>%
@@ -643,11 +672,12 @@ bucket_stats %>%
        y = "Bucket Type",
        title = "Brier Score for Each Type of Down and Distance",
        subtitle = "For downs 2-3, Short = 1-3 yards, Medium = 4-7 yards and Long = 8+ yards")
+ggsave('tracking-2.png', width = 15, height = 10, dpi = "retina")
 
 proe_stats <- probs_and_preds %>%
   group_by(possessionTeam) %>%
   summarize(avg_proe = 100*mean(proe, na.rm = T),
-            brier = mean((xpass - is_pass)^2)) %>%
+            brier = mean((xp - is_pass)^2)) %>%
   left_join(teams_colors_logos, by = c("possessionTeam" = "team_abbr")) %>%
   arrange(-avg_proe)
 
@@ -666,59 +696,52 @@ proe_stats %>%
   theme(axis.text.x = element_blank(),
         panel.grid.major.x = element_line(size = 0.1, colour = "gray")) +
   scale_y_continuous(breaks = pretty_breaks(n = 10))
-ggsave('tracking-1.png', width = 15, height = 10, dpi = "retina")
+ggsave('tracking-3.png', width = 15, height = 10, dpi = "retina")
 
 proe_stats %>%
-  mutate(team = fct_reorder(possessionTeam, brier)) %>%
+  mutate(team = fct_reorder(possessionTeam, -brier)) %>%
   ggplot(aes(x = team, y = brier)) +
   geom_bar(aes(fill = team_color, color = team_color2), stat = "identity", alpha = 0.9) +
-  #geom_image(aes(x = team, y = brier + 0.01, image = team_logo_espn), asp = 16/9, size = 0.035) +
+  geom_image(aes(image = team_logo_espn, y = brier + 0.002), asp = 16/9, size = 0.035) +
   scale_color_identity(aesthetics = c("fill", "color")) +
   theme_reach() +
   labs(x = "Team",
        y = "Brier Score",
        title = "Each Team's Expected Pass Brier Score, 2017",
-       subtitle = "Data from the Big Data Bowl, Week 1-6") +
+       subtitle = "In order from least predictable to most predictable") +
   theme(axis.text.x = element_blank(),
-        panel.grid.major.x = element_line(size = 0.1, colour = "gray")) +
-  scale_y_continuous(breaks = pretty_breaks(n = 10), limits = c(0.25, 0.41))
-
+        panel.grid.major.x = element_line(size = 0.1, colour = "gray")) 
+ggsave('tracking-4.png', width = 15, height = 10, dpi = "retina")
 
 expected_pass <- probs_and_preds %>%
-  filter(Pass >= 0.5) %>%
+  filter(xp >= 0.5) %>%
   group_by(possessionTeam) %>%
   summarize(pass_rate = mean(is_pass),
-            pass_brier = mean((Pass - probs_and_preds$is_pass)^2))
+            pass_brier = mean((xp - probs_and_preds$is_pass)^2))
 
 expected_run <- probs_and_preds %>%
-  filter(Run >= 0.5) %>%
+  filter(xp < 0.5) %>%
   group_by(possessionTeam) %>%
   summarize(run_rate = 1 - mean(is_pass),
-            run_brier = mean((Run - (1-probs_and_preds$is_pass))^2))
+            run_brier = mean(((1-xp) - (1-probs_and_preds$is_pass))^2))
 
 expected_all <- expected_pass %>%
   left_join(expected_run, by = c("possessionTeam")) %>%
   left_join(teams_colors_logos, by = c("possessionTeam" = "team_abbr"))
 
 expected_all %>%
-  ggplot(aes(x = pass_brier, y = run_brier)) +
+  ggplot(aes(x = pass_rate, y = run_rate)) +
   geom_image(aes(image = team_logo_espn), asp = 16/9, size = 0.05) +
   theme_reach() +
-  geom_hline(yintercept = mean(expected_all$run_brier), linetype = "dashed") +
-  geom_vline(xintercept = mean(expected_all$pass_brier), linetype = "dashed") +
-  labs(x = "Pass Brier Score",
-       y = "Run Brier Score",
+  geom_hline(yintercept = mean(expected_all$run_rate), linetype = "dashed") +
+  geom_vline(xintercept = mean(expected_all$pass_rate), linetype = "dashed") +
+  labs(x = "Pass Rate When Expected to Pass",
+       y = "Run Rate When Expected to Run",
        title = "Team Predictability in 2017 on Runs and Passes",
        subtitle = "Data from the Big Data Bowl, Week 1-6") +
   scale_y_continuous(breaks = pretty_breaks(n = 10)) +
-  scale_x_continuous(breaks = pretty_breaks(n = 10)) +
-  annotate("text", x = 0.915, y = 0.935, label = "Pass Predictable \n Run Predictable") +
-  annotate("text", x = 0.915, y = 0.745, label = "Pass Predictable \n Run Unpredictable") +
-  annotate("text", x = 0.725, y = 0.745, label = "Pass Unpredictable \n Run Unpredictable") +
-  annotate("text", x = 0.725, y = 0.935, label = "Pass Unpredictable \n Run Unpredictable") 
-ggsave('tracking-2.png', width = 15, height = 10, dpi = "retina")
-
-confusionMatrix(rf_test_preds, rf_test$pass_or_run)
+  scale_x_continuous(breaks = pretty_breaks(n = 10)) 
+ggsave('tracking-5.png', width = 15, height = 10, dpi = "retina")
 
 proe_stats <- proe_stats %>%
   mutate(posteam = ifelse(possessionTeam == "OAK", "LV", possessionTeam))
@@ -746,4 +769,180 @@ epa_stats %>%
        subtitle = "Data from the Big Data Bowl, Week 1-6") +
   scale_y_continuous(breaks = pretty_breaks(n = 10)) +
   scale_x_reverse(breaks = pretty_breaks(n = 10)) 
+
+plays_with_team <- plays_join %>%
+  select(pass_or_run, quarter, week, num_rb, num_wr, num_te,
+         is_shotgun, is_under_center, is_pistol, is_wildcat, defendersInTheBox,
+         width, linemen_width, prev_pass, linemen_height, rb_deep, is_fullback, 
+         width_sd, linemen_sd, receiver_offline, te_inline, is_motion, simple_xp,
+         possessionTeam) 
+
+plays_with_team <- plays_with_team %>%
+  mutate(pass_or_run = ifelse(pass_or_run == "Pass", 1, 0))
+
+passing_lmer <- lmer(pass_or_run ~ quarter + week + num_rb + num_wr + num_te + is_shotgun + is_under_center +
+                       is_pistol + is_wildcat + defendersInTheBox + width + linemen_width + prev_pass + linemen_height +
+                       rb_deep + is_fullback + width_sd + linemen_sd + receiver_offline + te_inline +
+                       is_motion + simple_xp + (1|possessionTeam), data = plays_with_team)
+
+summary(passing_lmer)
+
+VarCorr(passing_lmer) %>% 
+  as_tibble() %>% 
+  mutate(icc = vcov / sum(vcov)) %>% 
+  dplyr::select(grp, icc)
+
+library(merTools)
+team_effects <- REsim(passing_lmer)
+plotREsim(team_effects)
+
+team_effects <- team_effects %>%
+  mutate(low = mean - sd,
+         high = mean + sd)
+
+team_effects <- team_effects %>%
+  left_join(teams_colors_logos, by = c("groupID" = "team_abbr"))
+
+team_effects %>%
+  mutate(team = fct_reorder(groupID, mean)) %>%
+  ggplot(aes(x= team, y=mean)) + 
+  geom_pointrange(aes(ymin=(low),
+                      ymax=(high), color = team_color), size = 1.2, fatten = 3)+
+  scale_color_identity() +
+  coord_flip()+
+  theme_reach() +
+  geom_image(aes(x = team, y = -0.15, image = team_logo_espn), asp = 16/9, size = 0.03) +
+  labs(x = "Pass Rate Over Expected",
+       y = "",
+       title = "Mixed Effects for Pass Rate Over Expected",
+       subtitle = "2017, weeks 1-6 with teams considered as a factor")
+ggsave('tracking-6.png', width = 15, height = 10, dpi = "retina")
+
+# TIME FOR BINNING
+xp_cv_loso_calibration_results <- probs_and_preds %>%
+  mutate(
+    bin_pred_prob = round(xp / 0.05) * .05,
+  ) %>%
+  group_by(bucket, bin_pred_prob) %>%
+  # Calculate the calibration results:
+  summarize(
+    n_plays = n(),
+    n_complete = length(which(is_pass == 1)),
+    bin_actual_prob = n_complete / n_plays
+  )
+
+ann_text <- data.frame(
+  x = c(.25, 0.75), y = c(0.75, 0.25),
+  lab = c("More times\nthan expected", "Fewer times\nthan expected")
+)
+
+xp_cv_loso_calibration_results %>%
+  ungroup() %>%
+  filter(n_plays > 5) %>%
+  ggplot() +
+  geom_point(aes(x = bin_pred_prob, y = bin_actual_prob, size = n_plays)) +
+  geom_smooth(aes(x = bin_pred_prob, y = bin_actual_prob), method = "loess") +
+  geom_abline(slope = 1, intercept = 0, color = "black", lty = 2) +
+  coord_equal() +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    size = "Number of plays",
+    x = "Estimated dropback percentage",
+    y = "Observed dropback percentage",
+    title = "Down and Distance Calibration Results for Expected Pass Model",
+    subtitle = "2017, Weeks 1-6 based on 5% incremental buckets"
+  ) +
+  geom_text(data = ann_text, aes(x = x, y = y, label = lab), size = 3) +
+  theme_reach() + 
+  theme(legend.position = c(1, .05), legend.justification = c(1, 0),
+        strip.text = element_text(size = 12, face = "bold")) +
+  facet_wrap(~bucket, ncol = 4)
+ggsave('tracking-7.png', width = 15, height = 10, dpi = "retina")
+
+pbp_17_yardline <- pbp_17 %>%
+  dplyr::select(old_game_id, play_id, yardline_100)
+
+probs_and_preds <- probs_and_preds %>%
+  left_join(pbp_17_yardline, by = c("gameId" = "old_game_id", "playId" = "play_id"))
+
+probs_and_preds <- probs_and_preds %>%
+  mutate(yardline_bucket = case_when(
+    yardline_100 < 3 ~ "0-2 Yards From Endzone",
+    yardline_100 >= 3 & yardline_100 < 10 ~ "3-10 Yards From Endzone",
+    yardline_100 >= 10 & yardline_100 < 25 ~ "10-24 Yards From Endzone",
+    yardline_100 >= 25 & yardline_100 < 70 ~ "25-69 Yards From Endzone",
+    yardline_100 >= 70 & yardline_100 < 90 ~ "70-89 Yards From Endzone",
+    yardline_100 >= 90 ~ "90+ Yards From Endzone"
+  ))
+
+xp_cv_loso_calibration_results_yardline <- probs_and_preds %>%
+  mutate(
+    bin_pred_prob = round(xp / 0.05) * .05,
+  ) %>%
+  group_by(yardline_bucket, bin_pred_prob) %>%
+  # Calculate the calibration results:
+  summarize(
+    n_plays = n(),
+    n_complete = length(which(is_pass == 1)),
+    bin_actual_prob = n_complete / n_plays
+  )
+
+xp_cv_loso_calibration_results_yardline %>%
+  ungroup() %>%
+  filter(n_plays > 5) %>%
+  ggplot() +
+  geom_point(aes(x = bin_pred_prob, y = bin_actual_prob, size = n_plays)) +
+  geom_smooth(aes(x = bin_pred_prob, y = bin_actual_prob), method = "loess") +
+  geom_abline(slope = 1, intercept = 0, color = "black", lty = 2) +
+  coord_equal() +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    size = "Number of plays",
+    x = "Estimated dropback percentage",
+    y = "Observed dropback percentage",
+    title = "Yardline Calibration Results for Expected Pass Model",
+    subtitle = "2017, Weeks 1-6 based on 5% incremental buckets"
+  ) +
+  geom_text(data = ann_text, aes(x = x, y = y, label = lab), size = 3) +
+  theme_reach() + 
+  theme(legend.position = "bottom",
+        strip.text = element_text(size = 12, face = "bold")) +
+  facet_wrap(~yardline_bucket, ncol = 3)
+ggsave('tracking-8.png', width = 15, height = 10, dpi = "retina")
+
+pass_yardline_down <- pbp_rp_xp %>%
+  filter(down < 4) %>%
+  group_by(yardline_100, down) %>%
+  summarize(count = n(),
+            pass_rate = mean(pass))
+
+pass_yardline_down %>%
+  mutate(Down = as.factor(down)) %>%
+  ggplot(aes(yardline_100, y = pass_rate)) +
+  geom_point(aes(color = Down, size = count), alpha = 0.3) +
+  geom_smooth(aes(color = Down), se = FALSE, size = 3) +
+  scale_color_brewer(palette = "Set2") +
+  theme_reach() +
+  labs(x = "Yards Away From Endzone",
+       y = "Pass Rate",
+       title = "Pass Rate by Down and Yards Away from the Endzone",
+       subtitle = "2012-2017, size of dots represents sample size") +
+  guides(size = FALSE) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 14)) +
+  geom_vline(xintercept = 90, linetype = "dashed") +
+  geom_vline(xintercept = 70, linetype = "dashed") +
+  geom_vline(xintercept = 25, linetype = "dashed") +
+  geom_vline(xintercept = 10, linetype = "dashed") +
+  geom_vline(xintercept = 2, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_x_continuous(breaks = pretty_breaks(n = 10))
+ggsave('tracking-10.png', width = 15, height = 10, dpi = "retina")  
+  
+  
+
+
+
 
